@@ -1,12 +1,14 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 import { format } from "date-fns";
 import {
-  Activity, Clock, TrendingUp, Folders, DollarSign, Cpu, ArrowUpRight, Radio, Terminal,
+  Activity, Clock, TrendingUp, Folders, DollarSign, Cpu, ArrowUpRight, Radio, Terminal, GitMerge,
 } from "lucide-react";
 
 import { useResource } from "@/lib/api";
+import { cn } from "@/lib/cn";
 import { AGENTS, getAgent, type AgentKey } from "@/lib/agents";
 import {
   PageHeader, StatTile, Section, Card, CardHeader, CardTitle, CardEyebrow,
@@ -54,6 +56,34 @@ export default function Home() {
   const totalModelSessions = modelRows.reduce((a, r) => a + r.session_count, 0) || 1;
 
   const loading = sessionsRes.loading;
+
+  // ── Diff selection state ──────────────────────────────────────────────────
+  const [diffSelected, setDiffSelected] = useState<Set<string>>(new Set());
+
+  function handleCheckbox(id: string) {
+    setDiffSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else if (next.size < 2) {
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
+  function handleDiff() {
+    if (diffSelected.size !== 2) return;
+    const [idA, idB] = Array.from(diffSelected);
+    const sessA = sessions.find((s) => s.id === idA)!;
+    const sessB = sessions.find((s) => s.id === idB)!;
+    const [left, right] = new Date(sessA.timestamp) <= new Date(sessB.timestamp)
+      ? [sessA, sessB]
+      : [sessB, sessA];
+    const hostname = window.location.hostname;
+    window.location.href = `http://${hostname}:3000/sessions/diff/${left.id}/${right.id}`;
+  }
+  // ─────────────────────────────────────────────────────────────────────────
 
   return (
     <div className="px-8 py-8 max-w-[1600px] mx-auto space-y-10 pb-20">
@@ -165,9 +195,25 @@ export default function Home() {
               <Activity size={14} className="text-[var(--tt-brand)]" />
               <CardTitle className="!text-[13px]">Recent activity</CardTitle>
             </div>
-            <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-[0.18em] text-[var(--tt-fg-dim)]">
-              <Radio size={10} className="text-emerald-400" />
-              auto-sync 15s
+            <div className="flex items-center gap-3">
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={diffSelected.size < 2}
+                onClick={handleDiff}
+                className={cn(
+                  "transition-colors",
+                  diffSelected.size === 1 && "!border-yellow-500/60 !text-yellow-400 opacity-80 pointer-events-none",
+                  diffSelected.size === 2 && "!border-emerald-500/60 !bg-emerald-500/10 !text-emerald-400 hover:!bg-emerald-500/20",
+                )}
+              >
+                <GitMerge size={12} />
+                Diff
+              </Button>
+              <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-[0.18em] text-[var(--tt-fg-dim)]">
+                <Radio size={10} className="text-emerald-400" />
+                auto-sync 15s
+              </div>
             </div>
           </div>
 
@@ -184,42 +230,57 @@ export default function Home() {
               <Table>
                 <THead>
                   <TR>
-                    <TH className="pl-5">Agent</TH>
+                    <TH className="pl-3 w-8"></TH>
+                    <TH className="pl-2">Agent</TH>
                     <TH>Project</TH>
                     <TH>Context</TH>
                     <TH className="text-right pr-5">Time</TH>
                   </TR>
                 </THead>
                 <TBody>
-                  {sessions.slice(0, 50).map((s, i) => (
-                    <TR key={`${s.agent}-${s.id}-${i}`} interactive>
-                      <TD className="pl-5">
-                        <Link href={`/sessions/${s.id}?agent=${s.agent}`} className="block">
-                          <AgentBadge agent={s.agent} />
-                        </Link>
-                      </TD>
-                      <TD className="font-mono text-[12px] text-[var(--tt-fg-muted)] max-w-[160px] truncate" title={s.project}>
-                        <Link href={`/sessions/${s.id}?agent=${s.agent}`} className="block truncate">
-                          {s.project.split("/").pop()}
-                        </Link>
-                      </TD>
-                      <TD className="text-[var(--tt-fg)] max-w-[480px] truncate">
-                        <Link href={`/sessions/${s.id}?agent=${s.agent}`} className="block truncate">
-                          {s.display || s.text || (
-                            <span className="italic text-[var(--tt-fg-faint)]">No message content</span>
-                          )}
-                        </Link>
-                      </TD>
-                      <TD className="text-right pr-5 tabular text-[11px] text-[var(--tt-fg-muted)] group-hover:text-[var(--tt-brand)] transition-colors">
-                        <Link href={`/sessions/${s.id}?agent=${s.agent}`} className="block">
-                          <div>{format(new Date(s.timestamp), "HH:mm:ss")}</div>
-                          <div className="text-[10px] text-[var(--tt-fg-faint)] uppercase tracking-wider">
-                            {format(new Date(s.timestamp), "MMM d")}
-                          </div>
-                        </Link>
-                      </TD>
-                    </TR>
-                  ))}
+                  {sessions.slice(0, 50).map((s, i) => {
+                    const isChecked = diffSelected.has(s.id);
+                    const isDisabled = !isChecked && diffSelected.size >= 2;
+                    return (
+                      <TR key={`${s.agent}-${s.id}-${i}`} interactive className={isChecked ? "tt-tint-2" : ""}>
+                        <TD className="pl-3 pr-0 w-8">
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            disabled={isDisabled}
+                            onChange={() => handleCheckbox(s.id)}
+                            className="w-3.5 h-3.5 accent-emerald-400 cursor-pointer disabled:opacity-30"
+                            onClick={(e) => e.stopPropagation()}
+                          />
+                        </TD>
+                        <TD className="pl-2">
+                          <Link href={`/sessions/${s.id}?agent=${s.agent}`} className="block">
+                            <AgentBadge agent={s.agent} />
+                          </Link>
+                        </TD>
+                        <TD className="font-mono text-[12px] text-[var(--tt-fg-muted)] max-w-[160px] truncate" title={s.project}>
+                          <Link href={`/sessions/${s.id}?agent=${s.agent}`} className="block truncate">
+                            {s.project.split("/").pop()}
+                          </Link>
+                        </TD>
+                        <TD className="text-[var(--tt-fg)] max-w-[480px] truncate">
+                          <Link href={`/sessions/${s.id}?agent=${s.agent}`} className="block truncate">
+                            {s.display || s.text || (
+                              <span className="italic text-[var(--tt-fg-faint)]">No message content</span>
+                            )}
+                          </Link>
+                        </TD>
+                        <TD className="text-right pr-5 tabular text-[11px] text-[var(--tt-fg-muted)] group-hover:text-[var(--tt-brand)] transition-colors">
+                          <Link href={`/sessions/${s.id}?agent=${s.agent}`} className="block">
+                            <div>{format(new Date(s.timestamp), "HH:mm:ss")}</div>
+                            <div className="text-[10px] text-[var(--tt-fg-faint)] uppercase tracking-wider">
+                              {format(new Date(s.timestamp), "MMM d")}
+                            </div>
+                          </Link>
+                        </TD>
+                      </TR>
+                    );
+                  })}
                 </TBody>
               </Table>
             </div>

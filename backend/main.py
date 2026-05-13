@@ -1284,6 +1284,115 @@ async def capture_stats():
     return stats
 
 
+@app.get("/sessions/diff/{left}/{right}")
+async def get_sessions_diff(left: str, right: str):
+    """Return a structured diff between two sessions.
+
+    Collects all narrative text (thoughts, user messages, tool calls, responses)
+    from each session, combines into two strings, then runs difflib to extract
+    structured blocks with tag / left-lines / right-lines.
+    """
+    import difflib
+
+    sessions = await get_sessions_cached()
+
+    sess_left  = next((s for s in sessions if s["id"] == left),  None)
+    sess_right = next((s for s in sessions if s["id"] == right), None)
+
+    if not sess_left or not sess_right:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="One or both sessions not found")
+
+    async def _collect_text(sess: dict) -> str:
+        agent = sess["agent"]
+        sid   = sess["id"]
+        lines: list = []
+
+        try:
+            events = await get_session_detail(sid, agent)
+        except Exception:
+            if sess.get("display"):
+                lines.append(sess["display"])
+            for plan in sess.get("plans", []):
+                lines.append(plan.get("content", ""))
+            return "\n".join(lines)
+
+        if isinstance(events, dict) and "messages" in events:
+            # gemini / antigravity chat format
+            for msg in events["messages"]:
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            t = part.get("text", "")
+                            if t: lines.append(t)
+                elif isinstance(content, str) and content:
+                    lines.append(content)
+        elif isinstance(events, list):
+            for evt in events:
+                msg     = evt.get("message") or {}
+                payload = evt.get("payload") or {}
+                evt_type = evt.get("type", "")
+
+                # Thinking / reasoning
+                if evt_type == "assistant_thinking":
+                    thinking = payload.get("text") or payload.get("thinking") or ""
+                    if thinking:
+                        lines.append(f"[thinking] {thinking}")
+
+                content = (
+                    msg.get("content")
+                    or payload.get("content")
+                    or evt.get("content", "")
+                )
+                if isinstance(content, str) and content:
+                    lines.append(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        t = part.get("text") or part.get("thinking") or ""
+                        if t: lines.append(t)
+                        ptype = part.get("type", "")
+                        if ptype in ("tool_use", "tool_result"):
+                            inp = part.get("input") or part.get("content") or ""
+                            name = part.get("name", "")
+                            if isinstance(inp, str) and inp:
+                                lines.append(f"[tool:{name}] {inp}")
+                            elif isinstance(inp, dict):
+                                lines.append(f"[tool:{name}] {json.dumps(inp)}")
+
+                # Copilot response parts (list of dicts with 'value')
+                if evt_type == "assistant" and isinstance(payload, list):
+                    for part in payload:
+                        if isinstance(part, dict):
+                            v = part.get("value") or part.get("text") or ""
+                            if v: lines.append(v)
+
+        return "\n".join(line for line in lines if str(line).strip())
+
+    text_left  = await _collect_text(sess_left)
+    text_right = await _collect_text(sess_right)
+
+    lines_left  = text_left.splitlines()
+    lines_right = text_right.splitlines()
+
+    sm = difflib.SequenceMatcher(None, lines_left, lines_right, autojunk=False)
+
+    result = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            result.append({"tag": "equal",   "left": lines_left[i1:i2],  "right": lines_right[j1:j2]})
+        elif tag == "replace":
+            result.append({"tag": "replace", "left": lines_left[i1:i2],  "right": lines_right[j1:j2]})
+        elif tag == "delete":
+            result.append({"tag": "delete",  "left": lines_left[i1:i2],  "right": []})
+        elif tag == "insert":
+            result.append({"tag": "insert",  "left": [],                  "right": lines_right[j1:j2]})
+
+    return result
+
+
 @app.get("/sessions/{session_id}")
 async def get_session_detail(session_id: str, agent: str):
     if agent == "claude":
