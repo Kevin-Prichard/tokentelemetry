@@ -161,12 +161,20 @@ async function start() {
   // and the auto-opened browser lands on the wrong URL.
   await ensurePortsFree([3000, 8000]);
 
+  const captureMode = process.argv.includes('--capture') || process.argv.includes('-c');
+
   console.log('\n→ launching services…');
+  const backendEnv = { ...process.env };
+  if (captureMode) {
+    backendEnv.TT_CAPTURE_FULL_DATA = '1';
+    console.log('→ full data capture enabled (writing to ~/.tokentelemetry/capture.db)');
+  }
+
   const backend = spawn(venvPython, ['main.py'], {
     cwd: backendDir,
     stdio: 'inherit',
-    // detached on POSIX gives us a process group we can signal as a unit
     detached: !isWindows,
+    env: backendEnv,
   });
 
   const frontend = spawn('npm', ['run', 'dev', '--', '--port', '3000'], {

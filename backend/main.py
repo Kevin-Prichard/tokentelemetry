@@ -96,14 +96,14 @@ def _antigravity_infer_project(text: str) -> str:
     home_prefix = str(HOME).replace("\\", "/")
     # Escape any special regex chars in home_prefix
     escaped_home = re.escape(home_prefix)
-    
+
     # Also support common generic paths
     patterns = [
         rf'({escaped_home}/Documents/Developer/[A-Za-z0-9_./@-]+)',
         rf'({escaped_home}/[A-Za-z0-9_./@-]+)',
         r'(/[A-Za-z0-9_./@-]+)', # Generic Unix absolute path
     ]
-    
+
     if sys.platform == "win32":
         patterns.insert(0, r'([A-Za-z]:/[A-Za-z0-9_./@-]+)') # Windows absolute path (text is slash-normalized above)
 
@@ -117,7 +117,7 @@ def _antigravity_infer_project(text: str) -> str:
             if len(parts) >= 4:
                 return "/".join(parts[:4])
             return path
-            
+
     return "Antigravity / unassigned"
 
 class TokenUsage(BaseModel):
@@ -168,7 +168,7 @@ async def get_available_agents():
     agents = []
     if CLAUDE_DIR.exists(): agents.append("claude")
     if CODEX_DIR.exists(): agents.append("codex")
-    if GEMINI_DIR.exists(): 
+    if GEMINI_DIR.exists():
         agents.append("gemini")
         if (GEMINI_DIR / "antigravity").exists() or list((GEMINI_DIR / "tmp").glob("*")):
             agents.append("antigravity")
@@ -201,6 +201,76 @@ async def get_available_agents():
 def _scan_sessions_sync():
     sessions = []
     aliases = _load_project_aliases()
+    _enrichments: Dict[tuple, Dict] = {}
+
+    if CAPTURE_ENABLED:
+        _capture_reset_stats()
+
+    class _CaptureSink:
+        def __init__(self, kind: str, agent: str, sid: str):
+            self.kind = kind
+            self.agent = agent
+            self.sid = sid
+            self.seq = 0
+
+        def append(self, item: Dict[str, Any]):
+            if not CAPTURE_ENABLED:
+                return
+            try:
+                if self.kind == "user_messages":
+                    _capture_insert_user_message(
+                        self.sid,
+                        self.agent,
+                        self.seq,
+                        item.get("content", ""),
+                        item.get("timestamp"),
+                        item.get("raw"),
+                    )
+                elif self.kind == "tool_calls":
+                    _capture_insert_tool_call(
+                        self.sid,
+                        self.agent,
+                        self.seq,
+                        item.get("name", ""),
+                        item.get("arguments"),
+                        item.get("result"),
+                        bool(item.get("is_error")),
+                        item.get("timestamp"),
+                        item.get("raw"),
+                    )
+                elif self.kind == "contexts":
+                    _capture_insert_context(
+                        self.sid,
+                        self.agent,
+                        item.get("type"),
+                        item.get("title"),
+                        item.get("content"),
+                        item.get("path"),
+                        item.get("timestamp"),
+                    )
+            except Exception as _capture_err:
+                _log.warning("capture %s write failed for %s/%s: %s", self.kind, self.agent, self.sid, _capture_err)
+            finally:
+                self.seq += 1
+
+    def _enrich(agent: str, sid: str) -> Dict:
+        if (agent, sid) not in _enrichments:
+            _enrichments[(agent, sid)] = {
+                "user_messages": _CaptureSink("user_messages", agent, sid),
+                "tool_calls": _CaptureSink("tool_calls", agent, sid),
+                "system_prompt": None,
+                "contexts": _CaptureSink("contexts", agent, sid),
+            }
+        return _enrichments[(agent, sid)]
+
+    def _capture_upsert_session(sess: Dict[str, Any]) -> None:
+        if not CAPTURE_ENABLED:
+            return
+        try:
+            _sp = (_enrichments.get((sess.get("agent", ""), sess.get("id", ""))) or {}).get("system_prompt")
+            _capture_upsert_session_db(sess, system_prompt=_sp)
+        except Exception as _capture_err:
+            _log.warning("capture session write failed for %s/%s: %s", sess.get("agent"), sess.get("id"), _capture_err)
 
     def apply_alias(path: str) -> str:
         return aliases.get(path, path)
@@ -227,7 +297,23 @@ def _scan_sessions_sync():
                         if not sid: continue
                         ts = datetime.fromtimestamp(data.get("timestamp") / 1000, tz=timezone.utc) if data.get("timestamp") else _now()
                         if sid not in claude_sessions or ts > claude_sessions[sid]["timestamp"]:
-                            claude_sessions[sid] = {"id": sid, "agent": "claude", "project": apply_alias(data.get("project", "unknown")), "timestamp": ts, "display": data.get("display"), "tokens": {"input": 0, "output": 0, "cached": 0, "total": 0}, "mcp_tools": [], "has_plan": False, "plans": [], "model": None, "artifacts": []}
+                            claude_sessions[sid] = {
+                                "id": sid,
+                                "agent": "claude",
+                                "project": apply_alias(
+                                    data.get("project", "unknown")),
+                                "timestamp": ts,
+                                "display": data.get("display"),
+                                "tokens": {"input": 0,
+                                           "output": 0,
+                                           "cached": 0,
+                                           "total": 0},
+                                "mcp_tools": [],
+                                "has_plan": False,
+                                "plans": [],
+                                "model": None,
+                                "artifacts": []
+                            }
                     except: continue
         except: pass
 
@@ -240,6 +326,18 @@ def _scan_sessions_sync():
                     if memory_dir.exists():
                         for mf in memory_dir.glob("*.md"):
                             sess["artifacts"].append({"name": mf.name, "path": str(mf), "type": "document"})
+                            if CAPTURE_ENABLED:
+                                _enrich_ctx = _enrich("claude", sid)["contexts"]
+                                try:
+                                    _enrich_ctx.append({
+                                        "type": "project_memory",
+                                        "title": mf.name,
+                                        "content": mf.read_text(
+                                            encoding="utf-8", errors="replace"),
+                                        "path": str(mf),
+                                        "timestamp": None,
+                                    })
+                                except: pass
                 except: pass
 
                 # pending_edit_tool_ids: Set[str] = set()  # quality signals (commented out)
@@ -271,6 +369,15 @@ def _scan_sessions_sync():
                                             if plan_text:
                                                 sess["has_plan"] = True
                                                 sess["plans"].append({"session_id": sid, "agent": "claude", "timestamp": sess["timestamp"], "content": plan_text})
+                                        if CAPTURE_ENABLED:
+                                            _enrich("claude", sid)["tool_calls"].append({
+                                                "name": tool,
+                                                "arguments": item.get("input", {}),
+                                                "result": None,
+                                                "is_error": False,
+                                                "timestamp": data.get("timestamp"),
+                                                "raw": item,
+                                            })
                                     if item.get("type") == "thinking":
                                         t_text = item.get("thinking", "")
                                         if "plan" in t_text.lower() and len(t_text) > 100:
@@ -288,6 +395,35 @@ def _scan_sessions_sync():
                                 u_content = u_msg.get("content", "")
                                 if "/plan" in str(u_content):
                                     sess["has_plan"] = True
+                                if CAPTURE_ENABLED:
+                                    _enrich_cl = _enrich("claude", sid)
+                                    if isinstance(u_content, str):
+                                        _enrich_cl["user_messages"].append({
+                                            "content": u_content,
+                                            "timestamp": data.get("timestamp"),
+                                            "raw": data,
+                                        })
+                                    elif isinstance(u_content, list):
+                                        _texts = [it.get("text", "") for it in u_content if isinstance(it, dict) and it.get("type") == "text"]
+                                        if _texts:
+                                            _enrich_cl["user_messages"].append({
+                                                "content": "\n".join(_texts),
+                                                "timestamp": data.get("timestamp"),
+                                                "raw": data,
+                                            })
+                                        for it in u_content:
+                                            if isinstance(it, dict) and it.get("type") == "tool_result":
+                                                _trc = it.get("content", "")
+                                                if isinstance(_trc, list):
+                                                    _trc = " ".join(c.get("text", "") for c in _trc if isinstance(c, dict))
+                                                _enrich_cl["tool_calls"].append({
+                                                    "name": "(tool_result)",
+                                                    "arguments": None,
+                                                    "result": _trc,
+                                                    "is_error": it.get("is_error", False),
+                                                    "timestamp": data.get("timestamp"),
+                                                    "raw": it,
+                                                })
                                 # Quality signals (retry chain tracking) commented out:
                                 # if isinstance(u_content, list):
                                 #     for it in u_content:
@@ -326,7 +462,7 @@ def _scan_sessions_sync():
                             codex_sessions[sid] = {"id": sid, "agent": "codex", "project": "unknown", "timestamp": ts, "text": data.get("thread_name"), "tokens": {"input": 0, "output": 0, "cached": 0, "total": 0}, "mcp_tools": [], "has_plan": False, "plans": [], "model": None, "artifacts": []}
                     except: continue
         except: pass
-        
+
         # Process the 100 most recent sessions
         for sid, sess in list(codex_sessions.items())[-100:]:
             rollout_file = codex_file_map.get(sid)
@@ -368,6 +504,15 @@ def _scan_sessions_sync():
                                                 sess["has_plan"] = True
                                                 sess["plans"].append({"session_id": sid, "agent": "codex", "timestamp": sess["timestamp"], "content": content})
                                         except: pass
+                                    if CAPTURE_ENABLED:
+                                        _enrich("codex", sid)["tool_calls"].append({
+                                            "name": tool,
+                                            "arguments": data["payload"].get("arguments"),
+                                            "result": data["payload"].get("response"),
+                                            "is_error": False,
+                                            "timestamp": data.get("timestamp"),
+                                            "raw": data.get("payload", {}),
+                                        })
                 except: pass
         for s in codex_sessions.values():
             if not s.get("model") and s.get("_provider"):
@@ -443,6 +588,12 @@ def _scan_sessions_sync():
                                         txt = msg.get("content")[0].get("text", "") if isinstance(msg.get("content"), list) else str(msg.get("content"))
                                         if not first_msg: first_msg = txt
                                         if "/plan" in txt: has_plan = True
+                                        if CAPTURE_ENABLED:
+                                            _enrich(effective_agent, sid)["user_messages"].append({
+                                                "content": txt,
+                                                "timestamp": msg.get("timestamp"),
+                                                "raw": msg,
+                                            })
                                     if msg.get("type") == "gemini":
                                         mt = msg.get("tokens", {})
                                         tokens["input"] += mt.get("input", 0); tokens["output"] += mt.get("output", 0)
@@ -454,7 +605,7 @@ def _scan_sessions_sync():
                                                 plan_text = ""
                                                 pp = (tc.get("args") or {}).get("plan_path")
                                                 if pp:
-                                                    try: 
+                                                    try:
                                                         with open(pp, "r", encoding="utf-8", errors="replace") as pf:
                                                             plan_text = pf.read()
                                                     except: plan_text = f"(plan stored at {pp})"
@@ -463,6 +614,15 @@ def _scan_sessions_sync():
                                                 if plan_text:
                                                     has_plan = True
                                                     plans.append({"session_id": sid, "agent": effective_agent, "timestamp": ts, "content": plan_text})
+                                            if CAPTURE_ENABLED:
+                                                _enrich(effective_agent, sid)["tool_calls"].append({
+                                                    "name": tc.get("name", ""),
+                                                    "arguments": tc.get("args", {}),
+                                                    "result": tc.get("resultDisplay"),
+                                                    "is_error": False,
+                                                    "timestamp": msg.get("timestamp"),
+                                                    "raw": tc,
+                                                })
 
                                 # Skip "ghost" sessions
                                 if not has_user and tokens["total"] == 0 and not mcp_tools:
@@ -517,6 +677,14 @@ def _scan_sessions_sync():
                                     except: pass
                             _tkns = {"input": 0, "output": 0, "cached": 0, "total": 0, "cost": 0.0}
                             sessions.append({"id": _lsid, "agent": "antigravity", "project": project_path, "timestamp": _lts, "display": _first_msg[:100], "tokens": _tkns, "mcp_tools": [], "has_plan": _has_plan, "plans": _plans, "model": None, "artifacts": [], "cost": 0.0})
+                            if CAPTURE_ENABLED:
+                                _enrich_log = _enrich("antigravity", _lsid)
+                                for _le_msg in _msgs:
+                                    _enrich_log["user_messages"].append({
+                                        "content": str(_le_msg.get("message", "")),
+                                        "timestamp": _le_msg.get("timestamp"),
+                                        "raw": _le_msg,
+                                    })
                             _all_log_sids.add(_lsid)
                     except: pass
         except: pass
@@ -536,7 +704,7 @@ def _scan_sessions_sync():
                     mp = sess_dir / f"{fname}.metadata.json"
                     if fp.exists():
                         artifacts.append({"name": fname, "path": str(fp), "type": "document"})
-                        try: 
+                        try:
                             with open(fp, "r", encoding="utf-8", errors="replace") as f:
                                 body = f.read()
                         except: body = ""
@@ -551,7 +719,7 @@ def _scan_sessions_sync():
                                 ts = _aware(datetime.fromisoformat(updated.replace("Z", "+00:00")))
                                 if latest_ts is None or ts > latest_ts: latest_ts = ts
                         except: pass
-                
+
                 # Scan for media artifacts at the brain session root (Antigravity drops
                 # previews/screenshots here) and optionally in an artifacts/ subdir.
                 try:
@@ -621,6 +789,12 @@ def _scan_sessions_sync():
                                         txt = data.get("message", {}).get("content", "")
                                         if not first_msg and isinstance(txt, str): first_msg = txt
                                         if isinstance(txt, str) and "/plan" in txt: has_plan = True
+                                        if CAPTURE_ENABLED and isinstance(txt, str):
+                                            _enrich("qwen", sid)["user_messages"].append({
+                                                "content": txt,
+                                                "timestamp": data.get("timestamp"),
+                                                "raw": data,
+                                            })
                                     if data.get("type") == "assistant":
                                         if data.get("message", {}).get("model") and not model:
                                             model = data["message"]["model"]
@@ -630,6 +804,15 @@ def _scan_sessions_sync():
                                         for item in data.get("message", {}).get("content", []):
                                             if item.get("type") == "tool_use":
                                                 if item.get("name") not in mcp_tools: mcp_tools.append(item.get("name"))
+                                                if CAPTURE_ENABLED:
+                                                    _enrich("qwen", sid)["tool_calls"].append({
+                                                        "name": item.get("name", ""),
+                                                        "arguments": item.get("input", {}),
+                                                        "result": None,
+                                                        "is_error": False,
+                                                        "timestamp": data.get("timestamp"),
+                                                        "raw": item,
+                                                    })
                                             if item.get("type") == "thinking":
                                                 t_text = item.get("thinking", "")
                                                 if "plan" in t_text.lower() and len(t_text) > 100:
@@ -655,6 +838,18 @@ def _scan_sessions_sync():
                     model = meta.get("agent_config", {}).get("active_model")
                     project_path = apply_alias(meta.get("environment", {}).get("working_directory", "unknown"))
                     sessions.append({"id": sid, "agent": "vibe", "project": project_path, "timestamp": ts, "display": f"Vibe Session {sid[:8]}", "tokens": tokens, "mcp_tools": list(set(mcp_tools)), "has_plan": False, "plans": [], "model": model, "artifacts": []})
+                    if CAPTURE_ENABLED:
+                        _enrich_vibe = _enrich("vibe", sid)
+                        for _vm in data.get("messages", []):
+                            if _vm.get("role") == "user":
+                                _txt = _vm.get("content", "")
+                                if isinstance(_txt, list):
+                                    _txt = " ".join(c.get("text", "") for c in _txt if isinstance(c, dict))
+                                _enrich_vibe["user_messages"].append({
+                                    "content": str(_txt),
+                                    "timestamp": _vm.get("timestamp"),
+                                    "raw": _vm,
+                                })
             except: continue
 
     # 6. Cursor
@@ -679,11 +874,11 @@ def _scan_sessions_sync():
                         if p.replace("/", "-").strip("-") == pd.name:
                             project_path = p
                             break
-                
+
                 if not project_path:
                     # Fallback to slug reconstruction
                     project_path = "/" + pd.name.replace("-", "/")
-                
+
                 for trans_dir in (pd / "agent-transcripts").glob("*"):
                     if trans_dir.is_dir():
                         sid = trans_dir.name
@@ -719,6 +914,20 @@ def _scan_sessions_sync():
                                                 first_msg = c[0].get("text", "") if isinstance(c[0], dict) else str(c[0])
                                             elif isinstance(c, str):
                                                 first_msg = c
+                                        if data.get("role") == "user" and CAPTURE_ENABLED:
+                                            _enrich_cur = _enrich("cursor", sid)
+                                            _ctxt = ""
+                                            _cc = msg.get("content", [])
+                                            if isinstance(_cc, list):
+                                                _ctxt = " ".join(it.get("text", "") for it in _cc if isinstance(it, dict))
+                                            elif isinstance(_cc, str):
+                                                _ctxt = _cc
+                                            if _ctxt:
+                                                _enrich_cur["user_messages"].append({
+                                                    "content": _ctxt,
+                                                    "timestamp": data.get("timestamp"),
+                                                    "raw": data,
+                                                })
                                         if data.get("role") == "assistant":
                                             if msg.get("model") and not model: model = msg.get("model")
                                             usage = msg.get("usage", {}) if isinstance(msg.get("usage"), dict) else {}
@@ -734,6 +943,15 @@ def _scan_sessions_sync():
                                                         sub_name = sub_input.get("name") or sub_input.get("subagent_type")
                                                         if sub_name and sub_name not in subagents:
                                                             subagents.append(sub_name)
+                                                    if CAPTURE_ENABLED:
+                                                        _enrich("cursor", sid)["tool_calls"].append({
+                                                            "name": name,
+                                                            "arguments": item.get("input", {}),
+                                                            "result": None,
+                                                            "is_error": False,
+                                                            "timestamp": data.get("timestamp"),
+                                                            "raw": item,
+                                                        })
                                                 if item.get("type") == "thinking":
                                                     t_text = item.get("thinking", "")
                                                     if "plan" in t_text.lower() and len(t_text) > 100:
@@ -759,18 +977,18 @@ def _scan_sessions_sync():
                         with open(cf, "r", encoding="utf-8", errors="replace") as f:
                             data = json.load(f); sid = cf.stem; tokens = {"input": 0, "output": 0, "cached": 0, "total": 0}
                             first_msg = ""; plans = []; model = None
-                            
+
                             # Fallback to creation date if no requests
                             creation_ts = data.get("creationDate") or data.get("timestamp")
                             last_ts = datetime.fromtimestamp(creation_ts / 1000, tz=timezone.utc) if isinstance(creation_ts, (int, float)) else _now()
-                            
+
                             for req in data.get("requests", []):
                                 if not first_msg: first_msg = req.get("message", {}).get("text", "")
                                 if req.get("modelId") and not model:
                                     model = req.get("modelId").split("/")[-1]
                                 if req.get("timestamp"):
                                     ts_val = req.get("timestamp")
-                                    if isinstance(ts_val, (int, float)): 
+                                    if isinstance(ts_val, (int, float)):
                                         req_ts = datetime.fromtimestamp(ts_val / 1000, tz=timezone.utc)
                                         if req_ts > last_ts: last_ts = req_ts
                                 if "thinking" in req:
@@ -780,6 +998,14 @@ def _scan_sessions_sync():
                                         plans.append({"session_id": sid, "agent": "copilot", "timestamp": last_ts, "content": t_text})
                                 if "response" in req:
                                     for part in req["response"]: tokens["total"] += part.get("tokens", 0)
+                                if CAPTURE_ENABLED:
+                                    _req_txt = req.get("message", {}).get("text", "")
+                                    if _req_txt:
+                                        _enrich("copilot", sid)["user_messages"].append({
+                                            "content": _req_txt,
+                                            "timestamp": req.get("timestamp"),
+                                            "raw": req,
+                                        })
                             tokens["cost"] = calculate_cost(model, tokens["input"], tokens["output"], tokens["cached"])
                             sessions.append({"id": sid, "agent": "copilot", "project": project_path, "timestamp": last_ts, "display": first_msg[:100], "tokens": tokens, "mcp_tools": [], "has_plan": len(plans) > 0, "plans": plans, "model": model, "artifacts": [], "cost": tokens["cost"]})
                     except: continue
@@ -804,10 +1030,12 @@ def _scan_sessions_sync():
                     has_plan = False
                     plans: List[Dict[str, Any]] = []
                     # Model + tokens from assistant messages
+                    _raw_messages = []
                     for mrow in conn.execute("SELECT data FROM message WHERE session_id=? ORDER BY time_created", (sid,)):
                         try:
                             mdata = json.loads(mrow["data"] or "{}")
                         except: continue
+                        _raw_messages.append(mdata)
                         if mdata.get("role") == "assistant":
                             if not model:
                                 mi = mdata.get("model") or {}
@@ -815,10 +1043,12 @@ def _scan_sessions_sync():
                             if mdata.get("mode") == "plan":
                                 has_plan = True
                     # Parts: first user text, tool names, token totals from step-finish
+                    _raw_parts = []
                     for prow in conn.execute("SELECT data FROM part WHERE session_id=? ORDER BY time_created", (sid,)):
                         try:
                             pdata = json.loads(prow["data"] or "{}")
                         except: continue
+                        _raw_parts.append(pdata)
                         ptype = pdata.get("type")
                         if ptype == "text" and not first_user:
                             txt = pdata.get("text") or ""
@@ -832,6 +1062,39 @@ def _scan_sessions_sync():
                             tokens["output"] += tk.get("output", 0) or 0
                             cache = tk.get("cache") or {}
                             tokens["cached"] += (cache.get("read", 0) or 0) + (cache.get("write", 0) or 0)
+                    if CAPTURE_ENABLED:
+                        _enrich_oc = _enrich("opencode", sid)
+                        _msg_idx = 0
+                        for _mp in _raw_parts:
+                            _pt = _mp.get("type")
+                            if _pt == "text":
+                                _txt = _mp.get("text", "")
+                                if _txt:
+                                    _enrich_oc["user_messages"].append({
+                                        "content": _txt,
+                                        "timestamp": _mp.get("timeCreated"),
+                                        "raw": _mp,
+                                    })
+                            elif _pt == "tool":
+                                _enrich_oc["tool_calls"].append({
+                                    "name": _mp.get("tool", ""),
+                                    "arguments": _mp.get("input"),
+                                    "result": _mp.get("result"),
+                                    "is_error": _mp.get("state") == "error",
+                                    "timestamp": _mp.get("timeCreated"),
+                                    "raw": _mp,
+                                })
+                            _msg_idx += 1
+                        if _raw_messages:
+                            for _rm in _raw_messages:
+                                if _rm.get("role") == "user":
+                                    _enrich_oc["contexts"].append({
+                                        "type": "raw_message",
+                                        "title": f"user message {_rm.get('msgID', '?')}",
+                                        "content": json.dumps(_rm, default=str),
+                                        "path": None,
+                                        "timestamp": None,
+                                    })
                     tokens["total"] = tokens["input"] + tokens["output"] + tokens["cached"]
                     project_path = srow["directory"] or "unknown"
                     title = srow["title"] or ""
@@ -854,6 +1117,12 @@ def _scan_sessions_sync():
 
     # Global sort by timestamp descending
     sessions.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    if CAPTURE_ENABLED:
+        for _sess in sessions:
+            _capture_upsert_session(_sess)
+        _capture_finish_stats()
+
     return sessions
 
 
@@ -868,6 +1137,20 @@ import asyncio as _asyncio
 import time as _time
 from pricing import calculate_cost, PRICING, PRICING_UPDATED
 import logging as _logging
+
+CAPTURE_ENABLED = os.environ.get("TT_CAPTURE_FULL_DATA", "0") == "1"
+
+if CAPTURE_ENABLED:
+    from capture_db import (
+        upsert_session as _capture_upsert_session_db,
+        insert_user_message as _capture_insert_user_message,
+        insert_tool_call as _capture_insert_tool_call,
+        insert_context as _capture_insert_context,
+        reset_stats as _capture_reset_stats,
+        finish_stats as _capture_finish_stats,
+        get_stats as _capture_get_stats,
+        close as _close_capture_db,
+    )
 
 _log = _logging.getLogger("tokentelemetry.cache")
 
@@ -977,6 +1260,28 @@ async def invalidate_cache():
     _sessions_cache["data"] = None
     _sessions_cache["at"] = 0.0
     return {"ok": True}
+
+
+@app.get("/capture/stats")
+async def capture_stats():
+    """Return per-scan insert/skip counters for the capture database.
+
+    Only meaningful when TT_CAPTURE_FULL_DATA=1 is set.
+    Returns zeroed counters (and enabled=false) when capture is off.
+    """
+    if not CAPTURE_ENABLED:
+        return {
+            "enabled": False,
+            "scan_started_at": None,
+            "scan_finished_at": None,
+            "sessions_upserted": 0,
+            "user_messages": {"inserted": 0, "skipped": 0},
+            "tool_calls": {"inserted": 0, "skipped": 0},
+            "contexts": {"inserted": 0, "skipped": 0},
+        }
+    stats = _capture_get_stats()
+    stats["enabled"] = True
+    return stats
 
 
 @app.get("/sessions/{session_id}")
@@ -1435,10 +1740,10 @@ def _parse_skill_md(p: Path):
     try:
         text = p.read_text(errors="ignore")
     except: return None
-    
+
     name = p.parent.name
     description = ""
-    
+
     if text.startswith("---"):
         end = text.find("---", 3)
         if end > 0:
@@ -1457,7 +1762,7 @@ def _parse_skill_md(p: Path):
                         k = k.strip().lower(); v = v.strip().strip('"').strip("'")
                         if k == "name": name = v
                         elif k == "description": description = v
-                        
+
     return {"name": name, "description": (description or "")[:500]}
 
 def _collect_skills(base: Path, scope: str, agent: str):
@@ -1469,12 +1774,12 @@ def _collect_skills(base: Path, scope: str, agent: str):
         skills_dir = base / "skills"
     elif not base.exists():
         return out
-        
+
     for skill_md in skills_dir.glob("*/SKILL.md"):
         s = _parse_skill_md(skill_md)
         if s:
             out.append({**s, "scope": scope, "agent": agent, "source": str(skill_md)})
-    
+
     # Check for deeper nested skills (common in plugin structures)
     for skill_md in skills_dir.glob("*/skills/*/SKILL.md"):
         s = _parse_skill_md(skill_md)

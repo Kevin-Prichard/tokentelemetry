@@ -23,6 +23,7 @@ HARNESS_DIR = Path.home() / ".tokentelemetry"
 ALIASES_FILE = HARNESS_DIR / "aliases.json"
 HIDDEN_FILE = HARNESS_DIR / "hidden.json"
 VERSION_FILE = HARNESS_DIR / "VERSION"
+CAPTURE_DB = HARNESS_DIR / "capture.db"
 SCHEMA_VERSION = 1
 
 
