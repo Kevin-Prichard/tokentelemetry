@@ -135,6 +135,7 @@ TokenTelemetry stores lightweight state in `~/.tokentelemetry/`:
   aliases.json    # Rename/merge project folder paths
   hidden.json     # Hide specific projects from dashboard
   VERSION         # Current version
+  capture.db      # optional session capture to SQLite, enable with TT_CAPTURE_FULL_DATA=1
 ```
 
 All hand-editable JSON — no database, no config GUI needed.
